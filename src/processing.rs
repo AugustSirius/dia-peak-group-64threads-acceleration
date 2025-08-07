@@ -1,6 +1,6 @@
 use bitvec::prelude::*;
 use crate::utils::{
-    TimsTOFRawData, IndexedTimsTOFData, find_scan_for_index, TimsTOFData,
+    TimsTOFData, IndexedTimsTOFData, PartitionedIndexedData, PartitionedMS2Data, find_scan_for_index, 
     library_records_to_dataframe, merge_library_and_report, get_unique_precursor_ids, 
     process_library_fast, create_rt_im_dicts, build_lib_matrix, build_precursors_matrix_step1, 
     build_precursors_matrix_step2, build_range_matrix_step3, build_precursors_matrix_step3, 
@@ -11,6 +11,180 @@ use std::{collections::HashMap, error::Error, cmp::Ordering, sync::Arc, time::In
 use ndarray::{Array1, Array2, Array3, Array4, s, Axis, concatenate};
 use polars::prelude::*;
 use std::fs::File;
+
+// ======================= PARTITIONED VERSION OF PROCESSING =======================
+
+pub fn process_single_precursor_rsm_partitioned(
+    precursor_data: &PrecursorLibData,
+    ms1_partitioned: &PartitionedIndexedData,
+    ms2_partitioned: &PartitionedMS2Data,
+    frag_repeat_num: usize,
+    device: &str,
+) -> Result<(String, Array4<f32>, Vec<f32>), Box<dyn Error>> {
+    // Step 1: Build tensor representations
+    let (ms1_data_tensor, ms2_data_tensor) = build_precursors_matrix_step1(
+        &[precursor_data.ms1_data.clone()],
+        &[precursor_data.ms2_data.clone()],
+        device,
+    )?;
+    
+    let ms2_data_tensor_processed = build_precursors_matrix_step2(ms2_data_tensor);
+    
+    // Step 2: Build range matrices
+    let (ms1_range_list, ms2_range_list) = build_range_matrix_step3(
+        &ms1_data_tensor,
+        &ms2_data_tensor_processed,
+        frag_repeat_num,
+        "ppm",
+        20.0,
+        50.0,
+        device,
+    )?;
+    
+    let (re_ms1_data_tensor, re_ms2_data_tensor, ms1_extract_width_range_list, ms2_extract_width_range_list) = 
+        build_precursors_matrix_step3(
+            &ms1_data_tensor,
+            &ms2_data_tensor_processed,
+            frag_repeat_num,
+            "ppm",
+            20.0,
+            50.0,
+            device,
+        )?;
+    
+    // Step 3: Calculate extraction ranges
+    let i = 0;
+    let (ms1_range_min, ms1_range_max) = calculate_mz_range(&ms1_range_list, i);
+    let im_tolerance = 0.05f32;
+    let im_min = precursor_data.im - im_tolerance;
+    let im_max = precursor_data.im + im_tolerance;
+    
+    let precursor_mz = precursor_data.precursor_info[1];
+    
+    // Step 4: Extract MS1 data using partitioned data
+    let mut precursor_result_filtered = ms1_partitioned.slice_by_mz_im_range(
+        ms1_range_min, ms1_range_max, im_min, im_max
+    );
+    precursor_result_filtered.mz_values.iter_mut()
+        .for_each(|mz| *mz = (*mz * 1000.0).ceil());
+    
+    // Step 5: Extract MS2 data using partitioned data
+    let mut frag_result_filtered = extract_ms2_data_partitioned(
+        ms2_partitioned,
+        precursor_mz,
+        &ms2_range_list,
+        i,
+        im_min,
+        im_max,
+    )?;
+    
+    // Step 6: Build mask matrices
+    let (ms1_frag_moz_matrix, ms2_frag_moz_matrix) = build_mask_matrices(
+        &precursor_result_filtered,
+        &frag_result_filtered,
+        &ms1_extract_width_range_list,
+        &ms2_extract_width_range_list,
+        i,
+    )?;
+    
+    // Step 7: Use extracted aligned rt values
+    let all_rt = extract_aligned_rt_values(
+        &precursor_result_filtered,
+        &frag_result_filtered,
+        precursor_data.rt,
+    );
+    
+    // Step 8: Build intensity matrices
+    let ms1_extract_slice = ms1_extract_width_range_list.slice(s![i, .., ..]).to_owned();
+    let ms2_extract_slice = ms2_extract_width_range_list.slice(s![i, .., ..]).to_owned();
+    
+    let ms1_frag_rt_matrix = build_rt_intensity_matrix_optimized(
+        &precursor_result_filtered,
+        &ms1_extract_slice,
+        &ms1_frag_moz_matrix,
+        &all_rt,
+    )?;
+    
+    let ms2_frag_rt_matrix = build_rt_intensity_matrix_optimized(
+        &frag_result_filtered,
+        &ms2_extract_slice,
+        &ms2_frag_moz_matrix,
+        &all_rt,
+    )?;
+    
+    // Step 9: Reshape and combine matrices
+    let rsm_matrix = reshape_and_combine_matrices(
+        ms1_frag_rt_matrix,
+        ms2_frag_rt_matrix,
+        frag_repeat_num,
+    )?;
+    
+    // Return the RSM matrix and RT values
+    Ok((precursor_data.precursor_id.clone(), rsm_matrix, all_rt.to_vec()))
+}
+
+// Modified MS2 extraction for partitioned data
+pub fn extract_ms2_data_partitioned(
+    ms2_partitioned: &PartitionedMS2Data,
+    precursor_mz: f32,
+    ms2_range_list: &Array3<f32>,
+    i: usize,
+    im_min: f32,
+    im_max: f32,
+) -> Result<TimsTOFData, Box<dyn Error>> {
+    // Find the appropriate thread partition for this precursor
+    let thread_partition_idx = ms2_partitioned.find_thread_partition(precursor_mz);
+    
+    if thread_partition_idx >= ms2_partitioned.window_partitions.len() {
+        return Ok(TimsTOFData::new());
+    }
+    
+    let thread_partition = &ms2_partitioned.window_partitions[thread_partition_idx];
+    
+    // Find the appropriate MS2 window in this partition
+    let mut selected_window = None;
+    for ((low, high), partitioned_data) in thread_partition {
+        if precursor_mz >= *low && precursor_mz <= *high {
+            selected_window = Some(partitioned_data);
+            break;
+        }
+    }
+    
+    let mut result = if let Some(ms2_partitioned_data) = selected_window {
+        // Process all 66 MS2 ranges in parallel
+        let frag_results: Vec<TimsTOFData> = (0..66)
+            .into_iter()
+            .map(|j| {
+                let ms2_range_min_val = ms2_range_list[[i, j, 0]];
+                let ms2_range_max_val = ms2_range_list[[i, j, 1]];
+                
+                let ms2_range_min = (ms2_range_min_val - 1.0) / 1000.0;
+                let ms2_range_max = (ms2_range_max_val + 1.0) / 1000.0;
+                
+                if ms2_range_min <= 0.0 || ms2_range_max <= 0.0 || ms2_range_min >= ms2_range_max {
+                    TimsTOFData::new()
+                } else {
+                    ms2_partitioned_data.slice_by_mz_im_range(
+                        ms2_range_min, ms2_range_max, im_min, im_max
+                    )
+                }
+            })
+            .collect();
+        
+        TimsTOFData::merge(frag_results)
+    } else {
+        println!("  Warning: No MS2 data found for precursor m/z {:.4}", precursor_mz);
+        TimsTOFData::new()
+    };
+    
+    // Convert m/z values to integers
+    result.mz_values.iter_mut()
+        .for_each(|mz| *mz = (*mz * 1000.0).ceil());
+    
+    Ok(result)
+}
+
+// Keep the original functions for compatibility
 
 pub fn process_single_precursor_rsm(
     precursor_data: &PrecursorLibData,
@@ -204,11 +378,10 @@ pub fn create_final_dataframe(
     Ok(DataFrame::new(columns)?)
 }
 
-#[derive(Debug)]
 pub struct FastChunkFinder {
-    pub low_bounds: Vec<f32>,
-    pub high_bounds: Vec<f32>,
-    pub chunks: Vec<IndexedTimsTOFData>,
+    low_bounds: Vec<f32>,
+    high_bounds: Vec<f32>,
+    chunks: Vec<IndexedTimsTOFData>,
 }
 
 impl FastChunkFinder {
@@ -588,100 +761,4 @@ pub fn reshape_and_combine_matrices(
     
     // Add batch dimension
     Ok(full_frag_rt_matrix.insert_axis(Axis(0)))
-}
-
-/// Data partition structure containing a subset of MS1 and MS2 data
-pub struct DataPartition {
-    pub partition_id: usize,
-    pub mz_range: (f32, f32),
-    pub ms1_indexed: IndexedTimsTOFData,
-    pub ms2_finder: FastChunkFinder,
-}
-
-/// Partition indexed data into chunks based on m/z ranges
-pub fn partition_indexed_data(
-    ms1_indexed: &IndexedTimsTOFData,
-    ms2_indexed_pairs: &Vec<((f32, f32), IndexedTimsTOFData)>,
-    num_partitions: usize,
-) -> Result<Vec<DataPartition>, Box<dyn Error>> {
-    if num_partitions == 0 {
-        return Err("Number of partitions must be greater than 0".into());
-    }
-    
-    // Find global m/z range from MS1 data
-    let (global_min, global_max) = find_mz_range(ms1_indexed)?;
-    let partition_width = (global_max - global_min) / num_partitions as f32;
-    
-    println!("Global m/z range: {:.4} - {:.4}", global_min, global_max);
-    println!("Partition width: {:.4} m/z", partition_width);
-    
-    let mut partitions = Vec::with_capacity(num_partitions);
-    
-    for i in 0..num_partitions {
-        let mz_start = global_min + (i as f32 * partition_width);
-        let mz_end = if i == num_partitions - 1 { 
-            global_max + 1.0 // Add small buffer for last partition
-        } else { 
-            mz_start + partition_width 
-        };
-        
-        // Create MS1 partition
-        let ms1_partition = IndexedTimsTOFData::from_timstof_data(
-            ms1_indexed.slice_by_mz_range(mz_start, mz_end)
-        );
-        let ms1_points = ms1_partition.mz_values.len();
-        
-        // Create MS2 partitions - filter windows that overlap with this partition
-        let mut ms2_partitions = Vec::new();
-        for ((low, high), data) in ms2_indexed_pairs {
-            // Include window if it overlaps with partition
-            if *high >= mz_start && *low <= mz_end {
-                let ms2_subset = data.slice_by_mz_range(mz_start, mz_end);
-                if !ms2_subset.mz_values.is_empty() {
-                    let indexed_subset = IndexedTimsTOFData::from_timstof_data(ms2_subset);
-                    ms2_partitions.push(((*low, *high), indexed_subset));
-                }
-            }
-        }
-        
-        // Create FastChunkFinder for this partition's MS2 data
-        let ms2_finder = FastChunkFinder::new(ms2_partitions)?;
-        
-        println!("Partition {}: m/z {:.4}-{:.4}, {} MS1 points, {} MS2 windows", 
-                 i, mz_start, mz_end, ms1_points, ms2_finder.chunks.len());
-        
-        partitions.push(DataPartition {
-            partition_id: i,
-            mz_range: (mz_start, mz_end),
-            ms1_indexed: ms1_partition,
-            ms2_finder,
-        });
-    }
-    
-    Ok(partitions)
-}
-
-/// Find the global m/z range from indexed data
-fn find_mz_range(indexed_data: &IndexedTimsTOFData) -> Result<(f32, f32), Box<dyn Error>> {
-    if indexed_data.mz_values.is_empty() {
-        return Err("No m/z values in indexed data".into());
-    }
-    
-    // Since data is already sorted by m/z, we can just take first and last
-    let min_mz = indexed_data.mz_values.first().unwrap();
-    let max_mz = indexed_data.mz_values.last().unwrap();
-    
-    Ok((*min_mz, *max_mz))
-}
-
-/// Assign a precursor to a partition based on its m/z value
-pub fn assign_precursor_to_partition(precursor_mz: f32, partition_boundaries: &[(f32, f32)]) -> usize {
-    // Binary search would be more efficient, but for simplicity:
-    for (i, &(start, end)) in partition_boundaries.iter().enumerate() {
-        if precursor_mz >= start && precursor_mz < end {
-            return i;
-        }
-    }
-    // If not found (e.g., slightly outside range), assign to last partition
-    partition_boundaries.len() - 1
 }
