@@ -3,9 +3,7 @@ mod cache;
 mod processing;
 
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, AtomicU64, Ordering};
 use std::io::BufWriter;
-use std::time::{Instant, Duration};
 
 use cache::CacheManager;
 use utils::{
@@ -23,30 +21,10 @@ use processing::{
 };
 
 use rayon::prelude::*;
-use std::{error::Error, path::Path, env, fs::File};
+use std::{error::Error, path::Path, time::Instant, env, fs::File};
 use ndarray::{Array1, Array2, Array3, Array4, s, Axis};
 use polars::prelude::*;
 use ndarray_npy::{NpzWriter, write_npy};
-
-// Performance monitoring structures
-#[derive(Debug)]
-struct ThreadMetrics {
-    thread_id: usize,
-    start_time: Instant,
-    end_time: Instant,
-    items_processed: usize,
-}
-
-#[derive(Debug)]
-struct BatchPerformanceStats {
-    batch_idx: usize,
-    total_duration: Duration,
-    per_thread_metrics: Vec<ThreadMetrics>,
-    memory_usage_before: u64,
-    memory_usage_after: u64,
-    cpu_usage_percent: f32,
-    cache_misses_estimate: u64,
-}
 
 // New struct to hold RSM results
 #[derive(Debug)]
@@ -57,51 +35,32 @@ pub struct RSMPrecursorResults {
     pub all_rt: Vec<f32>,          // 396 RT values
 }
 
-// Helper function to get current memory usage
-fn get_memory_usage() -> u64 {
-    use sysinfo::{System, SystemExt};
-    let mut sys = System::new();
-    sys.refresh_memory();
-    sys.used_memory() * 1024 // Convert to bytes
-}
-
-// Helper function to estimate CPU usage
-fn get_cpu_usage() -> f32 {
-    use sysinfo::{System, SystemExt, ProcessExt};
-    let mut sys = System::new();
-    sys.refresh_processes();
-    
-    if let Some(process) = sys.process(sysinfo::get_current_pid().unwrap()) {
-        process.cpu_usage()
-    } else {
-        0.0
-    }
-}
-
 fn main() -> Result<(), Box<dyn Error>> {
     // Fixed parameters
     let batch_size = 1000;
-    let parallel_threads = std::env::var("PARALLEL_THREADS")
-        .unwrap_or_else(|_| "64".to_string())
-        .parse::<usize>()
-        .unwrap_or(64);
+    let parallel_threads = 64;
     let output_dir = "output_test";
+    
+    // let d_folder = "/Users/augustsirius/Desktop/raw_data/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d";
+    // let report_file_path = "/Users/augustsirius/Desktop/dia_peak_irt_iim_rust/20250730_v5.3_TPHPlib_frag1025_swissprot_final_all_from_Yueliang.parquet";
+    // let lib_file_path = "/Users/augustsirius/Desktop/raw_data/TPHPlib_frag1025_swissprot_final_all_from_Yueliang.tsv";
+
+    // let d_folder = "/storage/guotiannanLab/wangshuaiyao/006.DIABERT_TimsTOF_Rust/test_data/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d";
+    // let report_file_path = "/storage/guotiannanLab/wangshuaiyao/006.DIABERT_TimsTOF_Rust/dia_peak_irt_iim_rust/raw_data/20250730_v5.3_TPHPlib_frag1025_swissprot_final_all_from_Yueliang.parquet";
+    // let lib_file_path = "/storage/guotiannanLab/wangshuaiyao/006.DIABERT_TimsTOF_Rust/dia_peak_irt_iim_rust/raw_data/TPHPlib_frag1025_swissprot_final_all_from_Yueliang.tsv";
+    // let lib_file_path = "/storage/guotiannanLab/wangshuaiyao/006.DIABERT_TimsTOF_Rust/dia_peak_irt_iim_rust/raw_data/TPHPlib_frag1025_swissprot_final_all_from_Yueliang_only_decoy.tsv";
+    // let lib_file_path = "/storage/guotiannanLab/wangshuaiyao/006.DIABERT_TimsTOF_Rust/dia_peak_irt_iim_rust/raw_data/test_lib_10000precursor.tsv";
     
     let d_folder = "/wangshuaiyao/dia-bert-timstof/test_data/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d";
     let report_file_path = "/wangshuaiyao/dia-bert-timstof/lib/20250730_v5.3_TPHPlib_frag1025_swissprot_final_all_from_Yueliang.parquet";
+    // let lib_file_path = "/wangshuaiyao/dia-bert-timstof/lib/test_lib_10000precursor.tsv";
     let lib_file_path = "/wangshuaiyao/dia-bert-timstof/lib/TPHPlib_frag1025_swissprot_final_all_from_Yueliang_with_decoy.tsv";
-    
-    // Initialize thread pool and print system info
     rayon::ThreadPoolBuilder::new()
         .num_threads(parallel_threads)
         .build_global()
         .unwrap();
     
-    println!("\n========== SYSTEM CONFIGURATION ==========");
-    println!("Parallel threads configured: {}", parallel_threads);
-    println!("Available CPU cores: {}", num_cpus::get());
-    println!("Available logical CPUs: {}", num_cpus::get_physical());
-    println!("Initial memory usage: {:.2} GB", get_memory_usage() as f64 / 1e9);
+    println!("Initialized parallel processing with {} threads", parallel_threads);
     println!("Batch size: {}", batch_size);
     println!("Output directory: {}", output_dir);
     
@@ -195,7 +154,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &assay_rt_kept_dict,
         &assay_im_kept_dict,
         &lib_cols,
-        total_unique_precursors,
+        total_unique_precursors,  // Process all precursors
     )?;
     
     println!("  - Prepared data for {} precursors", precursor_lib_data_list.len());
@@ -209,9 +168,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("\n[Step 2] Processing {} precursors in {} batches", 
              precursor_lib_data_list.len(), total_batches);
     
-    // Global performance tracking - specify type explicitly
-    let mut all_batch_stats: Vec<BatchPerformanceStats> = Vec::new();
-    
     for batch_idx in 0..total_batches {
         let batch_start_idx = batch_idx * batch_size;
         let batch_end_idx = ((batch_idx + 1) * batch_size).min(precursor_lib_data_list.len());
@@ -222,38 +178,18 @@ fn main() -> Result<(), Box<dyn Error>> {
                  batch_start_idx + 1, batch_end_idx, batch_precursors.len());
         
         let batch_start = Instant::now();
-        let memory_before = get_memory_usage();
         
-        // Performance tracking for this batch
+        use std::sync::atomic::{AtomicUsize, Ordering};
         let processed_count = Arc::new(AtomicUsize::new(0));
-        let thread_start_times = Arc::new(Mutex::new(Vec::<Instant>::new()));
-        let thread_end_times = Arc::new(Mutex::new(Vec::<Instant>::new()));
-        let thread_work_distribution = Arc::new(Mutex::new(std::collections::HashMap::<usize, usize>::new()));
-        
         let batch_count = batch_precursors.len();
+        
         let results_mutex = Arc::new(Mutex::new(Vec::new()));
         
-        // Track work stealing and thread utilization
-        let work_steal_count = Arc::new(AtomicU64::new(0));
-        let total_processing_time = Arc::new(AtomicU64::new(0));
-        
-        // Process batch in parallel with detailed monitoring
+        // Process batch in parallel
         batch_precursors
             .par_iter()
             .enumerate()
             .for_each(|(batch_internal_idx, precursor_data)| {
-                let thread_id = rayon::current_thread_index().unwrap_or(999);
-                let task_start = Instant::now();
-                
-                // Record thread start
-                {
-                    let mut starts = thread_start_times.lock().unwrap();
-                    if starts.len() <= thread_id {
-                        starts.resize(thread_id + 1, Instant::now());
-                    }
-                    starts[thread_id] = task_start;
-                }
-                
                 let global_index = batch_start_idx + batch_internal_idx;
                 
                 let result = process_single_precursor_rsm(
@@ -264,25 +200,13 @@ fn main() -> Result<(), Box<dyn Error>> {
                     device,
                 );
                 
-                let task_duration = task_start.elapsed();
-                total_processing_time.fetch_add(task_duration.as_micros() as u64, Ordering::Relaxed);
-                
-                // Track work distribution
-                {
-                    let mut dist = thread_work_distribution.lock().unwrap();
-                    *dist.entry(thread_id).or_insert(0) += 1;
-                }
-                
                 let current = processed_count.fetch_add(1, Ordering::SeqCst) + 1;
-                
-                // Log every 100 items for thread distribution
-                if current % 100 == 0 {
-                    println!("[Thread {}] Processed {} items, last item took {:.3}ms", 
-                             thread_id, current, task_duration.as_secs_f32() * 1000.0);
-                }
                 
                 match result {
                     Ok((precursor_id, rsm_matrix, all_rt)) => {
+                        // println!("[Batch {} - {}/{}] ✓ Successfully processed: {} (global index: {})", 
+                        //          batch_idx + 1, current, batch_count, precursor_id, global_index);
+                        
                         let rsm_result = RSMPrecursorResults {
                             index: batch_internal_idx,
                             precursor_id: precursor_id.clone(),
@@ -294,52 +218,14 @@ fn main() -> Result<(), Box<dyn Error>> {
                         results.push(rsm_result);
                     },
                     Err(e) => {
-                        eprintln!("[Thread {} - Batch {} - {}/{}] ✗ Error processing {} (global index: {}): {}", 
-                                  thread_id, batch_idx + 1, current, batch_count, 
+                        eprintln!("[Batch {} - {}/{}] ✗ Error processing {} (global index: {}): {}", 
+                                  batch_idx + 1, current, batch_count, 
                                   precursor_data.precursor_id, global_index, e);
                     }
                 }
             });
         
         let batch_elapsed = batch_start.elapsed();
-        let memory_after = get_memory_usage();
-        let cpu_usage = get_cpu_usage();
-        
-        // Analyze thread work distribution
-        let work_dist = thread_work_distribution.lock().unwrap();
-        let mut thread_counts: Vec<(usize, usize)> = work_dist.iter()
-            .map(|(&k, &v)| (k, v))
-            .collect();
-        thread_counts.sort_by_key(|&(k, _)| k);
-        
-        println!("\n========== THREAD UTILIZATION ANALYSIS ==========");
-        println!("Thread work distribution:");
-        for (thread_id, count) in &thread_counts {
-            println!("  Thread {}: {} items ({:.1}%)", 
-                     thread_id, count, (*count as f32 / batch_count as f32) * 100.0);
-        }
-        
-        let max_work = thread_counts.iter().map(|(_, c)| c).max().unwrap_or(&0);
-        let min_work = thread_counts.iter().map(|(_, c)| c).min().unwrap_or(&0);
-        let work_imbalance = if *min_work > 0 {
-            (*max_work as f32 / *min_work as f32) - 1.0
-        } else {
-            f32::INFINITY
-        };
-        
-        println!("\nWork imbalance factor: {:.2}x", work_imbalance + 1.0);
-        println!("Active threads: {} / {}", thread_counts.len(), parallel_threads);
-        
-        let total_proc_time = total_processing_time.load(Ordering::Relaxed) as f64 / 1e6;
-        let theoretical_speedup = total_proc_time / batch_elapsed.as_secs_f64();
-        println!("Theoretical speedup: {:.2}x (total work: {:.2}s, elapsed: {:.2}s)", 
-                 theoretical_speedup, total_proc_time, batch_elapsed.as_secs_f64());
-        
-        println!("\n========== MEMORY ANALYSIS ==========");
-        println!("Memory before batch: {:.2} GB", memory_before as f64 / 1e9);
-        println!("Memory after batch: {:.2} GB", memory_after as f64 / 1e9);
-        println!("Memory delta: {:.2} MB", (memory_after as i64 - memory_before as i64) as f64 / 1e6);
-        println!("CPU usage: {:.1}%", cpu_usage);
         
         println!("\n========== SAVING BATCH {} RESULTS ==========", batch_idx + 1);
         let save_start = Instant::now();
@@ -360,8 +246,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Batch processing time: {:.5} seconds", batch_elapsed.as_secs_f32());
         println!("Average time per precursor: {:.5} seconds", 
                  batch_elapsed.as_secs_f32() / batch_count as f32);
-        println!("Efficiency: {:.1}% (theoretical speedup / thread count)", 
-                 (theoretical_speedup / parallel_threads as f64) * 100.0);
     }
     
     println!("\n========== OVERALL PROCESSING SUMMARY ==========");
@@ -371,14 +255,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Batch size: {}", batch_size);
     println!("Total batches: {}", total_batches);
     println!("Output directory: {}", output_dir);
-    
-    // Final performance analysis
-    println!("\n========== PERFORMANCE ANALYSIS RECOMMENDATIONS ==========");
-    println!("Based on the execution profile:");
-    println!("1. Check thread work distribution - uneven distribution indicates load balancing issues");
-    println!("2. Monitor memory delta - large increases may indicate memory pressure");
-    println!("3. Compare theoretical speedup vs actual thread count to identify bottlenecks");
-    println!("4. Low efficiency % suggests contention or I/O bottlenecks");
     
     Ok(())
 }
