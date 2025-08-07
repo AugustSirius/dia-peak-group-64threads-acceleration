@@ -7,7 +7,7 @@ use std::io::BufWriter;
 
 use cache::CacheManager;
 use utils::{
-    read_timstof_data, build_indexed_data, read_parquet_with_polars,
+    read_timstof_data, build_indexed_data, read_parquet_with_polars,IndexedTimsTOFData
     library_records_to_dataframe, merge_library_and_report, get_unique_precursor_ids, 
     process_library_fast, create_rt_im_dicts, build_lib_matrix, build_precursors_matrix_step1, 
     build_precursors_matrix_step2, build_range_matrix_step3, build_precursors_matrix_step3, 
