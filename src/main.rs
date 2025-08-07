@@ -70,7 +70,7 @@ pub struct RSMPrecursorResults {
 fn main() -> Result<(), Box<dyn Error>> {
     // Fixed parameters
     let batch_size = 1000;
-    let parallel_threads = 64;  // Set to 64 as requested
+    let parallel_threads = 32;  // Set to 64 as requested
     let output_dir = if SPEED_TEST_MODE { "output_diann_speedtest" } else { "output_diann" };
     
     let d_folder = "/wangshuaiyao/dia-bert-timstof/test_data/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d";
