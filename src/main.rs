@@ -39,10 +39,21 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Fixed parameters
     let batch_size = 1000;
     let parallel_threads = 64;
-    let output_dir = "output_test";
+    let output_dir = "output_diann";
+    
+    // let d_folder = "/Users/augustsirius/Desktop/raw_data/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d";
+    // let report_file_path = "/Users/augustsirius/Desktop/dia_peak_irt_iim_rust/20250730_v5.3_TPHPlib_frag1025_swissprot_final_all_from_Yueliang.parquet";
+    // let lib_file_path = "/Users/augustsirius/Desktop/raw_data/TPHPlib_frag1025_swissprot_final_all_from_Yueliang.tsv";
+
+    // let d_folder = "/storage/guotiannanLab/wangshuaiyao/006.DIABERT_TimsTOF_Rust/test_data/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d";
+    // let report_file_path = "/storage/guotiannanLab/wangshuaiyao/006.DIABERT_TimsTOF_Rust/dia_peak_irt_iim_rust/raw_data/20250730_v5.3_TPHPlib_frag1025_swissprot_final_all_from_Yueliang.parquet";
+    // let lib_file_path = "/storage/guotiannanLab/wangshuaiyao/006.DIABERT_TimsTOF_Rust/dia_peak_irt_iim_rust/raw_data/TPHPlib_frag1025_swissprot_final_all_from_Yueliang.tsv";
+    // let lib_file_path = "/storage/guotiannanLab/wangshuaiyao/006.DIABERT_TimsTOF_Rust/dia_peak_irt_iim_rust/raw_data/TPHPlib_frag1025_swissprot_final_all_from_Yueliang_only_decoy.tsv";
+    // let lib_file_path = "/storage/guotiannanLab/wangshuaiyao/006.DIABERT_TimsTOF_Rust/dia_peak_irt_iim_rust/raw_data/test_lib_10000precursor.tsv";
     
     let d_folder = "/wangshuaiyao/dia-bert-timstof/test_data/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d";
-    let report_file_path = "/wangshuaiyao/dia-bert-timstof/lib/20250730_v5.3_TPHPlib_frag1025_swissprot_final_all_from_Yueliang.parquet";
+    let report_file_path = "/wangshuaiyao/dia-bert-timstof/test_data/report.parquet";
+    // let lib_file_path = "/wangshuaiyao/dia-bert-timstof/lib/test_lib_10000precursor.tsv";
     let lib_file_path = "/wangshuaiyao/dia-bert-timstof/lib/TPHPlib_frag1025_swissprot_final_all_from_Yueliang_with_decoy.tsv";
     rayon::ThreadPoolBuilder::new()
         .num_threads(parallel_threads)
