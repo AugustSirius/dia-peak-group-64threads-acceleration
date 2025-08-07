@@ -1,0 +1,34 @@
+# Rust build artifacts
+/target/
+Cargo.lock
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Temporary and cache files
+*.tmp
+*.temp
+.cache/
+
+# Archive files
+*.tar.gz
+*.zip
+
+# Jupyter notebook checkpoints
+.ipynb_checkpoints/
+
+# Exclude stable version directory (seems like backup)
+稳定版/
+
+# Other build artifacts
+*.d
+*.rlib
+*.rmeta
+*.dylib
