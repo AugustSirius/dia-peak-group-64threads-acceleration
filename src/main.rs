@@ -7,8 +7,7 @@ use std::io::BufWriter;
 
 use cache::CacheManager;
 use utils::{
-    read_timstof_data, build_indexed_data, build_partitioned_indexed_data, read_parquet_with_polars,
-    IndexedTimsTOFData, PartitionedIndexedData, PartitionedMS2Data,
+    read_timstof_data, build_indexed_data, read_parquet_with_polars,IndexedTimsTOFData,
     library_records_to_dataframe, merge_library_and_report, get_unique_precursor_ids, 
     process_library_fast, create_rt_im_dicts, build_lib_matrix, build_precursors_matrix_step1, 
     build_precursors_matrix_step2, build_range_matrix_step3, build_precursors_matrix_step3, 
@@ -18,7 +17,7 @@ use utils::{
 use processing::{
     FastChunkFinder, build_rt_intensity_matrix_optimized, prepare_precursor_features,
     calculate_mz_range, extract_ms2_data, build_mask_matrices, extract_aligned_rt_values,
-    reshape_and_combine_matrices, process_single_precursor_rsm, process_single_precursor_rsm_partitioned
+    reshape_and_combine_matrices, process_single_precursor_rsm
 };
 
 use rayon::prelude::*;
@@ -71,7 +70,7 @@ pub struct RSMPrecursorResults {
 fn main() -> Result<(), Box<dyn Error>> {
     // Fixed parameters
     let batch_size = 1000;
-    let parallel_threads = 64;  // Use 64 threads as requested
+    let parallel_threads = 64;  // Set to 64 as requested
     let output_dir = if SPEED_TEST_MODE { "output_diann_speedtest" } else { "output_diann" };
     
     let d_folder = "/wangshuaiyao/dia-bert-timstof/test_data/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d";
@@ -79,7 +78,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     let lib_file_path = "/wangshuaiyao/dia-bert-timstof/lib/TPHPlib_frag1025_swissprot_final_all_from_Yueliang_with_decoy.tsv";
     
     println!("\n========== PERFORMANCE MONITORING ENABLED ==========");
-    println!("🎯 USING PARTITIONED DATA STRUCTURES FOR BETTER SCALING");
     if SPEED_TEST_MODE {
         println!("🚀 SPEED TEST MODE ENABLED - Processing first {} precursors only", SPEED_TEST_PRECURSOR_COUNT);
     } else {
@@ -109,22 +107,37 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     println!("\n========== DATA PREPARATION PHASE ==========");
     let total_start = Instant::now();
-    
-    // Load raw data
-    println!("Loading TimsTOF data...");
-    let raw_data_start = Instant::now();
-    let raw_data = read_timstof_data(d_path)?;
-    println!("Raw data reading time: {:.5} seconds", raw_data_start.elapsed().as_secs_f32());
-    println!("  - MS1 data points: {}", raw_data.ms1_data.mz_values.len());
-    println!("  - MS2 windows: {}", raw_data.ms2_windows.len());
-    
-    // Build partitioned indexed data for better parallel performance
-    println!("\n========== BUILDING PARTITIONED DATA STRUCTURES ==========");
-    let partitioning_start = Instant::now();
-    let (ms1_partitioned, ms2_partitioned) = build_partitioned_indexed_data(raw_data, parallel_threads)?;
-    println!("Partitioning time: {:.5} seconds", partitioning_start.elapsed().as_secs_f32());
+        
+    let (ms1_indexed, ms2_indexed_pairs) = if cache_manager.is_cache_valid(d_path) {
+        println!("Found valid cache, loading indexed data directly...");
+        let cache_load_start = Instant::now();
+        let (ms1_indexed, ms2_indexed_pairs) = cache_manager.load_indexed_data(d_path)?;
+        println!("Cache loading time: {:.5} seconds", cache_load_start.elapsed().as_secs_f32());
+        (ms1_indexed, ms2_indexed_pairs)
+    } else {
+        println!("Cache invalid or non-existent, reading TimsTOF data...");
+        
+        let raw_data_start = Instant::now();
+        let raw_data = read_timstof_data(d_path)?;
+        println!("Raw data reading time: {:.5} seconds", raw_data_start.elapsed().as_secs_f32());
+        println!("  - MS1 data points: {}", raw_data.ms1_data.mz_values.len());
+        println!("  - MS2 windows: {}", raw_data.ms2_windows.len());
+        
+        println!("\nBuilding indexed data structures...");
+        let index_start = Instant::now();
+        let (ms1_indexed, ms2_indexed_pairs) = build_indexed_data(raw_data)?;
+        println!("Index building time: {:.5} seconds", index_start.elapsed().as_secs_f32());
+        
+        let cache_save_start = Instant::now();
+        cache_manager.save_indexed_data(d_path, &ms1_indexed, &ms2_indexed_pairs)?;
+        println!("Cache saving time: {:.5} seconds", cache_save_start.elapsed().as_secs_f32());
+        
+        (ms1_indexed, ms2_indexed_pairs)
+    };
     
     println!("Total data preparation time: {:.5} seconds", total_start.elapsed().as_secs_f32());
+    
+    let finder = FastChunkFinder::new(ms2_indexed_pairs)?;
     
     // ================================ LIBRARY AND REPORT LOADING ================================
     println!("\n========== LIBRARY AND REPORT PROCESSING ==========");
@@ -146,7 +159,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let frag_repeat_num = 5;
     
     // ================================ BATCH PRECURSOR PROCESSING ================================
-    println!("\n========== BATCH PRECURSOR PROCESSING WITH PARTITIONED DATA ==========");
+    println!("\n========== BATCH PRECURSOR PROCESSING ==========");
     
     println!("\n[Step 1] Preparing library data for precursors");
     let prep_start = Instant::now();
@@ -182,7 +195,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         &assay_rt_kept_dict,
         &assay_im_kept_dict,
         &lib_cols,
-        precursors_to_process,
+        precursors_to_process,  // Use determined count
     )?;
     
     println!("  - Prepared data for {} precursors", precursor_lib_data_list.len());
@@ -219,7 +232,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         let results_mutex = Arc::new(Mutex::new(Vec::new()));
         let step_timings_mutex = Arc::new(Mutex::new(StepTimings::new()));
         
-        // Process batch in parallel with partitioned data
+        // Process batch in parallel with detailed timing
         batch_precursors
             .par_iter()
             .enumerate()
@@ -227,11 +240,11 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let global_index = batch_start_idx + batch_internal_idx;
                 let thread_id = rayon::current_thread_index().unwrap_or(999);
                 
-                // Process with partitioned data structures
-                let result = process_single_precursor_with_timing_partitioned(
+                // Process with detailed timing
+                let result = process_single_precursor_with_timing(
                     precursor_data,
-                    &ms1_partitioned,
-                    &ms2_partitioned,
+                    &ms1_indexed,
+                    &finder,
                     frag_repeat_num,
                     device,
                     thread_id,
@@ -318,7 +331,6 @@ fn main() -> Result<(), Box<dyn Error>> {
     
     // Print overall performance summary
     println!("\n========== OVERALL PERFORMANCE SUMMARY ==========");
-    println!("🎯 PARTITIONED DATA STRUCTURE RESULTS");
     if SPEED_TEST_MODE {
         println!("🚀 SPEED TEST MODE RESULTS");
         println!("Processed: {} precursors (out of {} total in library)", 
@@ -329,7 +341,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         println!("Total processed: {} precursors", precursor_lib_data_list.len());
     }
     
-    println!("Processing mode: Parallel ({} threads) with partitioned data", parallel_threads);
+    println!("Processing mode: Parallel ({} threads)", parallel_threads);
     println!("Batch size: {}", batch_size);
     println!("Total batches: {}", total_batches);
     println!("Total processing time: {:.2} seconds", overall_processing_time.as_secs_f32());
@@ -337,43 +349,38 @@ fn main() -> Result<(), Box<dyn Error>> {
              precursor_lib_data_list.len() as f32 / overall_processing_time.as_secs_f32());
     
     println!("\nGlobal average step timings (ms per precursor):");
-    let total_step_time = global_step_timings.matrix_building + global_step_timings.ms1_extraction +
-                          global_step_timings.ms2_extraction + global_step_timings.mask_building +
-                          global_step_timings.rt_extraction + global_step_timings.intensity_matrix +
-                          global_step_timings.reshape_combine;
-    
     println!("  Matrix building:    {:.3} ms ({:.1}%)", 
              global_step_timings.matrix_building / global_precursor_count as f64 * 1000.0,
-             global_step_timings.matrix_building / total_step_time * 100.0);
+             global_step_timings.matrix_building / global_step_timings.total * 100.0);
     println!("  MS1 extraction:     {:.3} ms ({:.1}%)", 
              global_step_timings.ms1_extraction / global_precursor_count as f64 * 1000.0,
-             global_step_timings.ms1_extraction / total_step_time * 100.0);
+             global_step_timings.ms1_extraction / global_step_timings.total * 100.0);
     println!("  MS2 extraction:     {:.3} ms ({:.1}%)", 
              global_step_timings.ms2_extraction / global_precursor_count as f64 * 1000.0,
-             global_step_timings.ms2_extraction / total_step_time * 100.0);
+             global_step_timings.ms2_extraction / global_step_timings.total * 100.0);
     println!("  Mask building:      {:.3} ms ({:.1}%)", 
              global_step_timings.mask_building / global_precursor_count as f64 * 1000.0,
-             global_step_timings.mask_building / total_step_time * 100.0);
+             global_step_timings.mask_building / global_step_timings.total * 100.0);
     println!("  RT extraction:      {:.3} ms ({:.1}%)", 
              global_step_timings.rt_extraction / global_precursor_count as f64 * 1000.0,
-             global_step_timings.rt_extraction / total_step_time * 100.0);
+             global_step_timings.rt_extraction / global_step_timings.total * 100.0);
     println!("  Intensity matrix:   {:.3} ms ({:.1}%)", 
              global_step_timings.intensity_matrix / global_precursor_count as f64 * 1000.0,
-             global_step_timings.intensity_matrix / total_step_time * 100.0);
+             global_step_timings.intensity_matrix / global_step_timings.total * 100.0);
     println!("  Reshape & combine:  {:.3} ms ({:.1}%)", 
              global_step_timings.reshape_combine / global_precursor_count as f64 * 1000.0,
-             global_step_timings.reshape_combine / total_step_time * 100.0);
+             global_step_timings.reshape_combine / global_step_timings.total * 100.0);
     
     println!("\nOutput directory: {}", output_dir);
     
     Ok(())
 }
 
-// New function with detailed timing using partitioned data
-fn process_single_precursor_with_timing_partitioned(
+// New function with detailed timing
+fn process_single_precursor_with_timing(
     precursor_data: &PrecursorLibData,
-    ms1_partitioned: &PartitionedIndexedData,
-    ms2_partitioned: &PartitionedMS2Data,
+    ms1_indexed: &IndexedTimsTOFData,
+    finder: &FastChunkFinder,
     frag_repeat_num: usize,
     device: &str,
     thread_id: usize,
@@ -382,25 +389,116 @@ fn process_single_precursor_with_timing_partitioned(
     let total_start = Instant::now();
     let mut local_timings = StepTimings::new();
     
-    // Use the partitioned processing function
+    // Step 1: Build tensor representations
     let step_start = Instant::now();
-    let result = process_single_precursor_rsm_partitioned(
-        precursor_data,
-        ms1_partitioned,
-        ms2_partitioned,
-        frag_repeat_num,
+    let (ms1_data_tensor, ms2_data_tensor) = build_precursors_matrix_step1(
+        &[precursor_data.ms1_data.clone()],
+        &[precursor_data.ms2_data.clone()],
         device,
-    );
-    local_timings.total = step_start.elapsed().as_secs_f64();
+    )?;
     
-    // For simplicity, we'll attribute most time to MS1/MS2 extraction since that's the bottleneck
-    local_timings.ms1_extraction = local_timings.total * 0.3;
-    local_timings.ms2_extraction = local_timings.total * 0.3;
-    local_timings.matrix_building = local_timings.total * 0.1;
-    local_timings.mask_building = local_timings.total * 0.1;
-    local_timings.rt_extraction = local_timings.total * 0.05;
-    local_timings.intensity_matrix = local_timings.total * 0.1;
-    local_timings.reshape_combine = local_timings.total * 0.05;
+    let ms2_data_tensor_processed = build_precursors_matrix_step2(ms2_data_tensor);
+    
+    let (ms1_range_list, ms2_range_list) = build_range_matrix_step3(
+        &ms1_data_tensor,
+        &ms2_data_tensor_processed,
+        frag_repeat_num,
+        "ppm",
+        20.0,
+        50.0,
+        device,
+    )?;
+    
+    let (re_ms1_data_tensor, re_ms2_data_tensor, ms1_extract_width_range_list, ms2_extract_width_range_list) = 
+        build_precursors_matrix_step3(
+            &ms1_data_tensor,
+            &ms2_data_tensor_processed,
+            frag_repeat_num,
+            "ppm",
+            20.0,
+            50.0,
+            device,
+        )?;
+    local_timings.matrix_building = step_start.elapsed().as_secs_f64();
+    
+    // Step 2: Extract MS1 data
+    let step_start = Instant::now();
+    let i = 0;
+    let (ms1_range_min, ms1_range_max) = calculate_mz_range(&ms1_range_list, i);
+    let im_tolerance = 0.05f32;
+    let im_min = precursor_data.im - im_tolerance;
+    let im_max = precursor_data.im + im_tolerance;
+    
+    let mut precursor_result_filtered = ms1_indexed.slice_by_mz_im_range(
+        ms1_range_min, ms1_range_max, im_min, im_max
+    );
+    precursor_result_filtered.mz_values.iter_mut()
+        .for_each(|mz| *mz = (*mz * 1000.0).ceil());
+    local_timings.ms1_extraction = step_start.elapsed().as_secs_f64();
+    
+    // Step 3: Extract MS2 data
+    let step_start = Instant::now();
+    let precursor_mz = precursor_data.precursor_info[1];
+    let mut frag_result_filtered = extract_ms2_data(
+        finder,
+        precursor_mz,
+        &ms2_range_list,
+        i,
+        im_min,
+        im_max,
+    )?;
+    local_timings.ms2_extraction = step_start.elapsed().as_secs_f64();
+    
+    // Step 4: Build mask matrices
+    let step_start = Instant::now();
+    let (ms1_frag_moz_matrix, ms2_frag_moz_matrix) = build_mask_matrices(
+        &precursor_result_filtered,
+        &frag_result_filtered,
+        &ms1_extract_width_range_list,
+        &ms2_extract_width_range_list,
+        i,
+    )?;
+    local_timings.mask_building = step_start.elapsed().as_secs_f64();
+    
+    // Step 5: Extract aligned RT values
+    let step_start = Instant::now();
+    let all_rt = extract_aligned_rt_values(
+        &precursor_result_filtered,
+        &frag_result_filtered,
+        precursor_data.rt,
+    );
+    local_timings.rt_extraction = step_start.elapsed().as_secs_f64();
+    
+    // Step 6: Build intensity matrices
+    let step_start = Instant::now();
+    let ms1_extract_slice = ms1_extract_width_range_list.slice(s![i, .., ..]).to_owned();
+    let ms2_extract_slice = ms2_extract_width_range_list.slice(s![i, .., ..]).to_owned();
+    
+    let ms1_frag_rt_matrix = build_rt_intensity_matrix_optimized(
+        &precursor_result_filtered,
+        &ms1_extract_slice,
+        &ms1_frag_moz_matrix,
+        &all_rt,
+    )?;
+    
+    let ms2_frag_rt_matrix = build_rt_intensity_matrix_optimized(
+        &frag_result_filtered,
+        &ms2_extract_slice,
+        &ms2_frag_moz_matrix,
+        &all_rt,
+    )?;
+    local_timings.intensity_matrix = step_start.elapsed().as_secs_f64();
+    
+    // Step 7: Reshape and combine matrices
+    let step_start = Instant::now();
+    let rsm_matrix = reshape_and_combine_matrices(
+        ms1_frag_rt_matrix,
+        ms2_frag_rt_matrix,
+        frag_repeat_num,
+    )?;
+    local_timings.reshape_combine = step_start.elapsed().as_secs_f64();
+    
+    local_timings.total = total_start.elapsed().as_secs_f64();
     
     // Update shared timings
     {
@@ -417,11 +515,14 @@ fn process_single_precursor_with_timing_partitioned(
     
     // Log slow precursors (taking more than 50ms)
     if local_timings.total > 0.05 {
-        println!("[Thread {}] Slow precursor {}: {:.3}s total",
-                 thread_id, precursor_data.precursor_id, local_timings.total);
+        println!("[Thread {}] Slow precursor {}: {:.3}s total (matrix:{:.3}, ms1:{:.3}, ms2:{:.3}, mask:{:.3}, rt:{:.3}, intensity:{:.3}, reshape:{:.3})",
+                 thread_id, precursor_data.precursor_id, local_timings.total,
+                 local_timings.matrix_building, local_timings.ms1_extraction, local_timings.ms2_extraction,
+                 local_timings.mask_building, local_timings.rt_extraction, local_timings.intensity_matrix,
+                 local_timings.reshape_combine);
     }
     
-    result
+    Ok((precursor_data.precursor_id.clone(), rsm_matrix, all_rt.to_vec()))
 }
 
 fn save_batch_results_as_npy(
@@ -501,7 +602,6 @@ fn save_batch_results_as_npy(
     writeln!(id_file, "# RSM matrix shape: [{}, {}, {}, {}]", n_original, frag_repeat_num, n_fragments, n_scans)?;
     writeln!(id_file, "# RT values shape: [{}, {}]", n_original, n_scans)?;
     writeln!(id_file, "# Mode: {}", if SPEED_TEST_MODE { "SPEED TEST" } else { "FULL PROCESSING" })?;
-    writeln!(id_file, "# Processing: PARTITIONED DATA STRUCTURES")?;
     writeln!(id_file, "# Row_Index\tPrecursor_ID\tStatus")?;
     
     for (i, (id, status)) in precursor_ids.iter().zip(status_list.iter()).enumerate() {

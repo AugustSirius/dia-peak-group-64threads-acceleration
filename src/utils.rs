@@ -24,201 +24,6 @@ pub struct PrecursorLibData {
     pub precursor_info: Vec<f32>,
 }
 
-// ======================= NEW PARTITIONED DATA STRUCTURES =======================
-
-/// Partitioned indexed data for better parallel performance
-#[derive(Debug, Clone)]
-pub struct PartitionedIndexedData {
-    pub partitions: Vec<IndexedTimsTOFData>,
-    pub mz_boundaries: Vec<f32>,  // Boundaries between partitions
-    pub total_points: usize,
-}
-
-impl PartitionedIndexedData {
-    /// Create partitioned data from indexed data
-    pub fn from_indexed(data: IndexedTimsTOFData, num_partitions: usize) -> Self {
-        if data.mz_values.is_empty() || num_partitions == 0 {
-            return Self {
-                partitions: vec![data],
-                mz_boundaries: vec![f32::NEG_INFINITY, f32::INFINITY],
-                total_points: 0,
-            };
-        }
-
-        let total_points = data.mz_values.len();
-        
-        // Since data is already sorted by m/z, we can partition efficiently
-        let points_per_partition = (total_points + num_partitions - 1) / num_partitions;
-        
-        let mut partitions = Vec::with_capacity(num_partitions);
-        let mut mz_boundaries = Vec::with_capacity(num_partitions + 1);
-        
-        // First boundary is the minimum m/z
-        mz_boundaries.push(data.mz_values[0]);
-        
-        for p in 0..num_partitions {
-            let start = p * points_per_partition;
-            let end = ((p + 1) * points_per_partition).min(total_points);
-            
-            if start >= total_points {
-                break;
-            }
-            
-            let partition = IndexedTimsTOFData {
-                rt_values_min: data.rt_values_min[start..end].to_vec(),
-                mobility_values: data.mobility_values[start..end].to_vec(),
-                mz_values: data.mz_values[start..end].to_vec(),
-                intensity_values: data.intensity_values[start..end].to_vec(),
-                frame_indices: data.frame_indices[start..end].to_vec(),
-                scan_indices: data.scan_indices[start..end].to_vec(),
-            };
-            
-            partitions.push(partition);
-            
-            // Add boundary at the end of this partition
-            if end < total_points {
-                mz_boundaries.push(data.mz_values[end]);
-            }
-        }
-        
-        // Last boundary is infinity
-        mz_boundaries.push(f32::INFINITY);
-        
-        Self {
-            partitions,
-            mz_boundaries,
-            total_points,
-        }
-    }
-    
-    /// Find which partition(s) contain the given m/z range
-    #[inline]
-    pub fn find_partitions(&self, mz_min: f32, mz_max: f32) -> Vec<usize> {
-        let mut result = Vec::new();
-        
-        for (i, partition) in self.partitions.iter().enumerate() {
-            if partition.mz_values.is_empty() {
-                continue;
-            }
-            
-            let partition_min = partition.mz_values[0];
-            let partition_max = partition.mz_values[partition.mz_values.len() - 1];
-            
-            // Check if ranges overlap
-            if mz_max >= partition_min && mz_min <= partition_max {
-                result.push(i);
-            }
-        }
-        
-        result
-    }
-    
-    /// Extract data for a specific m/z and IM range
-    pub fn slice_by_mz_im_range(&self, mz_min: f32, mz_max: f32, im_min: f32, im_max: f32) -> TimsTOFData {
-        let partition_indices = self.find_partitions(mz_min, mz_max);
-        
-        if partition_indices.is_empty() {
-            return TimsTOFData::new();
-        }
-        
-        // If only one partition, directly use it
-        if partition_indices.len() == 1 {
-            return self.partitions[partition_indices[0]].slice_by_mz_im_range(mz_min, mz_max, im_min, im_max);
-        }
-        
-        // Multiple partitions - merge results
-        let mut results = Vec::new();
-        for &idx in &partition_indices {
-            let partial = self.partitions[idx].slice_by_mz_im_range(mz_min, mz_max, im_min, im_max);
-            if !partial.mz_values.is_empty() {
-                results.push(partial);
-            }
-        }
-        
-        TimsTOFData::merge(results)
-    }
-}
-
-/// Partitioned MS2 data organized by precursor m/z windows
-#[derive(Debug)]
-pub struct PartitionedMS2Data {
-    pub window_partitions: Vec<Vec<((f32, f32), PartitionedIndexedData)>>,
-    pub precursor_boundaries: Vec<f32>,
-}
-
-impl PartitionedMS2Data {
-    /// Create partitioned MS2 data
-    pub fn from_indexed_pairs(
-        pairs: Vec<((f32, f32), IndexedTimsTOFData)>, 
-        num_thread_partitions: usize,
-        num_data_partitions: usize
-    ) -> Self {
-        if pairs.is_empty() {
-            return Self {
-                window_partitions: vec![vec![]],
-                precursor_boundaries: vec![f32::NEG_INFINITY, f32::INFINITY],
-            };
-        }
-        
-        // Sort pairs by precursor m/z (center of window)
-        let mut sorted_pairs = pairs;
-        sorted_pairs.sort_by(|a, b| {
-            let center_a = (a.0.0 + a.0.1) / 2.0;
-            let center_b = (b.0.0 + b.0.1) / 2.0;
-            center_a.partial_cmp(&center_b).unwrap()
-        });
-        
-        // Divide into thread partitions
-        let pairs_per_thread = (sorted_pairs.len() + num_thread_partitions - 1) / num_thread_partitions;
-        let mut window_partitions = Vec::with_capacity(num_thread_partitions);
-        let mut precursor_boundaries = Vec::with_capacity(num_thread_partitions + 1);
-        
-        precursor_boundaries.push(f32::NEG_INFINITY);
-        
-        for t in 0..num_thread_partitions {
-            let start = t * pairs_per_thread;
-            let end = ((t + 1) * pairs_per_thread).min(sorted_pairs.len());
-            
-            if start >= sorted_pairs.len() {
-                break;
-            }
-            
-            let mut thread_partition = Vec::with_capacity(end - start);
-            
-            for i in start..end {
-                let ((low, high), indexed_data) = sorted_pairs[i].clone();
-                let partitioned = PartitionedIndexedData::from_indexed(indexed_data, num_data_partitions);
-                thread_partition.push(((low, high), partitioned));
-            }
-            
-            window_partitions.push(thread_partition);
-            
-            if end < sorted_pairs.len() {
-                let boundary = (sorted_pairs[end - 1].0.1 + sorted_pairs[end].0.0) / 2.0;
-                precursor_boundaries.push(boundary);
-            }
-        }
-        
-        precursor_boundaries.push(f32::INFINITY);
-        
-        Self {
-            window_partitions,
-            precursor_boundaries,
-        }
-    }
-    
-    /// Find which thread partition should handle this precursor m/z
-    #[inline]
-    pub fn find_thread_partition(&self, precursor_mz: f32) -> usize {
-        for (i, window) in self.precursor_boundaries.windows(2).enumerate() {
-            if precursor_mz >= window[0] && precursor_mz < window[1] {
-                return i;
-            }
-        }
-        0 // Default to first partition
-    }
-}
-
 // ======================= OPTIMIZED FUNCTION =======================
 // 优化版本：避免在并行循环中重复遍历 library_records
 pub fn prepare_precursor_lib_data(
@@ -480,7 +285,7 @@ impl IndexedTimsTOFData {
         
         // Use parallel filtering for ion mobility
         let indices: Vec<usize> = (range.start..range.end)
-            .into_par_iter()
+            // .into_par_iter()
             .filter(|&i| {
                 let im = self.mobility_values[i];
                 im >= im_min && im <= im_max
@@ -515,7 +320,7 @@ impl IndexedTimsTOFData {
     }
 }
 
-/// 构建索引数据 - Modified to support partitioning
+/// 构建索引数据
 pub fn build_indexed_data(raw_data: TimsTOFRawData) -> Result<(IndexedTimsTOFData, Vec<((f32, f32), IndexedTimsTOFData)>), Box<dyn Error>> {
     // 为 MS1 数据构建索引
     let ms1_indexed = IndexedTimsTOFData::from_timstof_data(raw_data.ms1_data);
@@ -528,36 +333,6 @@ pub fn build_indexed_data(raw_data: TimsTOFRawData) -> Result<(IndexedTimsTOFDat
     
     Ok((ms1_indexed, ms2_indexed_pairs))
 }
-
-/// Build partitioned indexed data for better parallel performance
-pub fn build_partitioned_indexed_data(
-    raw_data: TimsTOFRawData,
-    num_thread_partitions: usize,
-) -> Result<(PartitionedIndexedData, PartitionedMS2Data), Box<dyn Error>> {
-    println!("Building partitioned indexed data with {} thread partitions...", num_thread_partitions);
-    let start = Instant::now();
-    
-    // Build indexed data first
-    let (ms1_indexed, ms2_indexed_pairs) = build_indexed_data(raw_data)?;
-    
-    // Calculate optimal number of data partitions per thread
-    let num_data_partitions = 4; // Each thread partition gets 4 sub-partitions for better cache locality
-    
-    // Partition MS1 data
-    let ms1_partitioned = PartitionedIndexedData::from_indexed(ms1_indexed, num_thread_partitions * num_data_partitions);
-    println!("  MS1 partitioned into {} partitions", ms1_partitioned.partitions.len());
-    
-    // Partition MS2 data
-    let ms2_partitioned = PartitionedMS2Data::from_indexed_pairs(ms2_indexed_pairs, num_thread_partitions, num_data_partitions);
-    println!("  MS2 partitioned into {} thread groups", ms2_partitioned.window_partitions.len());
-    
-    println!("  Partitioning completed in {:.3} seconds", start.elapsed().as_secs_f32());
-    
-    Ok((ms1_partitioned, ms2_partitioned))
-}
-
-// Keep all the existing helper functions and structs unchanged...
-// (Rest of the file remains the same)
 
 #[inline]
 pub fn quantize(x: f32) -> u32 { 
@@ -635,9 +410,6 @@ impl TimsTOFData {
     }
 }
 
-// Include all the rest of the original functions unchanged...
-// (Constants, LibCols, LibraryRecord, and all helper functions remain the same)
-
 // 常量定义
 pub const MS1_ISOTOPE_COUNT: usize = 6;
 pub const FRAGMENT_VARIANTS: usize = 3;
@@ -707,9 +479,6 @@ pub struct LibraryRecord {
     pub decoy: String,
     pub other_columns: HashMap<String, String>,
 }
-
-// Include all the rest of the helper functions unchanged...
-// (All the build_ms1_data, build_ms2_data, etc. functions remain exactly the same)
 
 pub fn find_scan_for_index(index: usize, scan_offsets: &[usize]) -> usize {
     for (scan, window) in scan_offsets.windows(2).enumerate() {
