@@ -38,7 +38,7 @@ pub struct RSMPrecursorResults {
 fn main() -> Result<(), Box<dyn Error>> {
     // Fixed parameters
     let batch_size = 1000;
-    let parallel_threads = 32;
+    let parallel_threads = 16;
     let output_dir = "output_diann";
     
     // let d_folder = "/Users/augustsirius/Desktop/raw_data/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d";
