@@ -26,6 +26,10 @@ use ndarray::{Array1, Array2, Array3, Array4, s, Axis};
 use polars::prelude::*;
 use ndarray_npy::{NpzWriter, write_npy};
 
+// Speed test parameters
+const SPEED_TEST_MODE: bool = true;  // Set to false to process ALL precursors
+const SPEED_TEST_PRECURSOR_COUNT: usize = 10000;  // Number of precursors for speed test
+
 // Performance monitoring struct
 #[derive(Debug, Clone)]
 pub struct StepTimings {
@@ -67,13 +71,18 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Fixed parameters
     let batch_size = 1000;
     let parallel_threads = 64;  // Set to 64 as requested
-    let output_dir = "output_diann";
+    let output_dir = if SPEED_TEST_MODE { "output_diann_speedtest" } else { "output_diann" };
     
     let d_folder = "/wangshuaiyao/dia-bert-timstof/test_data/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d";
     let report_file_path = "/wangshuaiyao/dia-bert-timstof/test_data/report.parquet";
     let lib_file_path = "/wangshuaiyao/dia-bert-timstof/lib/TPHPlib_frag1025_swissprot_final_all_from_Yueliang_with_decoy.tsv";
     
     println!("\n========== PERFORMANCE MONITORING ENABLED ==========");
+    if SPEED_TEST_MODE {
+        println!("🚀 SPEED TEST MODE ENABLED - Processing first {} precursors only", SPEED_TEST_PRECURSOR_COUNT);
+    } else {
+        println!("📊 FULL PROCESSING MODE - Processing ALL precursors");
+    }
     println!("Parallel threads: {}", parallel_threads);
     
     rayon::ThreadPoolBuilder::new()
@@ -152,7 +161,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // ================================ BATCH PRECURSOR PROCESSING ================================
     println!("\n========== BATCH PRECURSOR PROCESSING ==========");
     
-    println!("\n[Step 1] Preparing library data for all precursors");
+    println!("\n[Step 1] Preparing library data for precursors");
     let prep_start = Instant::now();
     
     let unique_precursor_ids: Vec<String> = diann_precursor_id_all
@@ -166,16 +175,27 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("\n========== LIBRARY STATISTICS ==========");
     println!("Total unique precursor IDs in library: {}", total_unique_precursors);
     
+    // Determine how many precursors to process
+    let precursors_to_process = if SPEED_TEST_MODE {
+        SPEED_TEST_PRECURSOR_COUNT.min(total_unique_precursors)
+    } else {
+        total_unique_precursors
+    };
+    
+    if SPEED_TEST_MODE {
+        println!("🚀 Speed test mode: Processing only first {} precursors", precursors_to_process);
+    }
+    
     let lib_cols = LibCols::default();
     
-    // Process all precursors (no max_precursors limit)
+    // Process precursors based on mode
     let precursor_lib_data_list = prepare_precursor_lib_data(
         &library_records,
         &unique_precursor_ids,
         &assay_rt_kept_dict,
         &assay_im_kept_dict,
         &lib_cols,
-        total_unique_precursors,  // Process all precursors
+        precursors_to_process,  // Use determined count
     )?;
     
     println!("  - Prepared data for {} precursors", precursor_lib_data_list.len());
@@ -192,6 +212,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // Global performance tracking
     let mut global_step_timings = StepTimings::new();
     let mut global_precursor_count = 0;
+    let overall_processing_start = Instant::now();
     
     for batch_idx in 0..total_batches {
         let batch_start_idx = batch_idx * batch_size;
@@ -306,13 +327,26 @@ fn main() -> Result<(), Box<dyn Error>> {
                  batch_elapsed.as_secs_f32() / batch_count as f32);
     }
     
+    let overall_processing_time = overall_processing_start.elapsed();
+    
     // Print overall performance summary
     println!("\n========== OVERALL PERFORMANCE SUMMARY ==========");
-    println!("Total unique precursor IDs in library: {}", total_unique_precursors);
-    println!("Total processed: {} precursors", precursor_lib_data_list.len());
+    if SPEED_TEST_MODE {
+        println!("🚀 SPEED TEST MODE RESULTS");
+        println!("Processed: {} precursors (out of {} total in library)", 
+                 precursor_lib_data_list.len(), total_unique_precursors);
+    } else {
+        println!("📊 FULL PROCESSING MODE RESULTS");
+        println!("Total unique precursor IDs in library: {}", total_unique_precursors);
+        println!("Total processed: {} precursors", precursor_lib_data_list.len());
+    }
+    
     println!("Processing mode: Parallel ({} threads)", parallel_threads);
     println!("Batch size: {}", batch_size);
     println!("Total batches: {}", total_batches);
+    println!("Total processing time: {:.2} seconds", overall_processing_time.as_secs_f32());
+    println!("Overall throughput: {:.2} precursors/second", 
+             precursor_lib_data_list.len() as f32 / overall_processing_time.as_secs_f32());
     
     println!("\nGlobal average step timings (ms per precursor):");
     println!("  Matrix building:    {:.3} ms ({:.1}%)", 
@@ -567,6 +601,7 @@ fn save_batch_results_as_npy(
     writeln!(id_file, "# Failed: {}", n_original - results.len())?;
     writeln!(id_file, "# RSM matrix shape: [{}, {}, {}, {}]", n_original, frag_repeat_num, n_fragments, n_scans)?;
     writeln!(id_file, "# RT values shape: [{}, {}]", n_original, n_scans)?;
+    writeln!(id_file, "# Mode: {}", if SPEED_TEST_MODE { "SPEED TEST" } else { "FULL PROCESSING" })?;
     writeln!(id_file, "# Row_Index\tPrecursor_ID\tStatus")?;
     
     for (i, (id, status)) in precursor_ids.iter().zip(status_list.iter()).enumerate() {
