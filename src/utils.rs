@@ -22,6 +22,7 @@ pub struct PrecursorLibData {
     pub ms1_data: MSDataArray,
     pub ms2_data: MSDataArray,
     pub precursor_info: Vec<f32>,
+    pub partition_id: usize,  // Add this field
 }
 
 // ======================= OPTIMIZED FUNCTION =======================
@@ -84,6 +85,7 @@ pub fn prepare_precursor_lib_data(
                                 ms1_data: ms1_data_list[0].clone(),
                                 ms2_data: ms2_data_list[0].clone(),
                                 precursor_info: precursor_info_list[0].clone(),
+                                partition_id: 0,  // Add this line - will be set later
                             })
                         } else {
                             None

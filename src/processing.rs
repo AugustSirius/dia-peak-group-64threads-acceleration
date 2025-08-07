@@ -1,6 +1,6 @@
 use bitvec::prelude::*;
 use crate::utils::{
-    TimsTOFRawData, IndexedTimsTOFData, find_scan_for_index, 
+    TimsTOFRawData, IndexedTimsTOFData, find_scan_for_index, TimsTOFData,
     library_records_to_dataframe, merge_library_and_report, get_unique_precursor_ids, 
     process_library_fast, create_rt_im_dicts, build_lib_matrix, build_precursors_matrix_step1, 
     build_precursors_matrix_step2, build_range_matrix_step3, build_precursors_matrix_step3, 
@@ -204,10 +204,11 @@ pub fn create_final_dataframe(
     Ok(DataFrame::new(columns)?)
 }
 
+#[derive(Debug)]
 pub struct FastChunkFinder {
-    low_bounds: Vec<f32>,
-    high_bounds: Vec<f32>,
-    chunks: Vec<IndexedTimsTOFData>,
+    pub low_bounds: Vec<f32>,
+    pub high_bounds: Vec<f32>,
+    pub chunks: Vec<IndexedTimsTOFData>,
 }
 
 impl FastChunkFinder {
@@ -587,4 +588,100 @@ pub fn reshape_and_combine_matrices(
     
     // Add batch dimension
     Ok(full_frag_rt_matrix.insert_axis(Axis(0)))
+}
+
+/// Data partition structure containing a subset of MS1 and MS2 data
+pub struct DataPartition {
+    pub partition_id: usize,
+    pub mz_range: (f32, f32),
+    pub ms1_indexed: IndexedTimsTOFData,
+    pub ms2_finder: FastChunkFinder,
+}
+
+/// Partition indexed data into chunks based on m/z ranges
+pub fn partition_indexed_data(
+    ms1_indexed: &IndexedTimsTOFData,
+    ms2_indexed_pairs: &Vec<((f32, f32), IndexedTimsTOFData)>,
+    num_partitions: usize,
+) -> Result<Vec<DataPartition>, Box<dyn Error>> {
+    if num_partitions == 0 {
+        return Err("Number of partitions must be greater than 0".into());
+    }
+    
+    // Find global m/z range from MS1 data
+    let (global_min, global_max) = find_mz_range(ms1_indexed)?;
+    let partition_width = (global_max - global_min) / num_partitions as f32;
+    
+    println!("Global m/z range: {:.4} - {:.4}", global_min, global_max);
+    println!("Partition width: {:.4} m/z", partition_width);
+    
+    let mut partitions = Vec::with_capacity(num_partitions);
+    
+    for i in 0..num_partitions {
+        let mz_start = global_min + (i as f32 * partition_width);
+        let mz_end = if i == num_partitions - 1 { 
+            global_max + 1.0 // Add small buffer for last partition
+        } else { 
+            mz_start + partition_width 
+        };
+        
+        // Create MS1 partition
+        let ms1_partition = IndexedTimsTOFData::from_timstof_data(
+            ms1_indexed.slice_by_mz_range(mz_start, mz_end)
+        );
+        let ms1_points = ms1_partition.mz_values.len();
+        
+        // Create MS2 partitions - filter windows that overlap with this partition
+        let mut ms2_partitions = Vec::new();
+        for ((low, high), data) in ms2_indexed_pairs {
+            // Include window if it overlaps with partition
+            if *high >= mz_start && *low <= mz_end {
+                let ms2_subset = data.slice_by_mz_range(mz_start, mz_end);
+                if !ms2_subset.mz_values.is_empty() {
+                    let indexed_subset = IndexedTimsTOFData::from_timstof_data(ms2_subset);
+                    ms2_partitions.push(((*low, *high), indexed_subset));
+                }
+            }
+        }
+        
+        // Create FastChunkFinder for this partition's MS2 data
+        let ms2_finder = FastChunkFinder::new(ms2_partitions)?;
+        
+        println!("Partition {}: m/z {:.4}-{:.4}, {} MS1 points, {} MS2 windows", 
+                 i, mz_start, mz_end, ms1_points, ms2_finder.chunks.len());
+        
+        partitions.push(DataPartition {
+            partition_id: i,
+            mz_range: (mz_start, mz_end),
+            ms1_indexed: ms1_partition,
+            ms2_finder,
+        });
+    }
+    
+    Ok(partitions)
+}
+
+/// Find the global m/z range from indexed data
+fn find_mz_range(indexed_data: &IndexedTimsTOFData) -> Result<(f32, f32), Box<dyn Error>> {
+    if indexed_data.mz_values.is_empty() {
+        return Err("No m/z values in indexed data".into());
+    }
+    
+    // Since data is already sorted by m/z, we can just take first and last
+    let min_mz = indexed_data.mz_values.first().unwrap();
+    let max_mz = indexed_data.mz_values.last().unwrap();
+    
+    Ok((*min_mz, *max_mz))
+}
+
+/// Assign a precursor to a partition based on its m/z value
+pub fn assign_precursor_to_partition(precursor_mz: f32, partition_boundaries: &[(f32, f32)]) -> usize {
+    // Binary search would be more efficient, but for simplicity:
+    for (i, &(start, end)) in partition_boundaries.iter().enumerate() {
+        if precursor_mz >= start && precursor_mz < end {
+            return i;
+        }
+    }
+    // If not found (e.g., slightly outside range), assign to last partition
+    partition_boundaries.len() - 1
 }
