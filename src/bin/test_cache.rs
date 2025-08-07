@@ -4,7 +4,7 @@ use std::io::Read;
 use std::path::Path;
 
 fn main() {
-    let cache_path = ".timstof_cache/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d.ms1_indexed.cache";
+    let cache_path = "/wangshuaiyao/dia-bert-timstof/00.TimsTOF_Rust/jiangheng/dia-peak-group-64threads-acceleration/.timstof_cache/CAD20220207yuel_TPHP_DIA_pool1_Slot2-54_1_4382.d.ms1_indexed.cache";
     
     println!("Testing cache file reading...");
     
